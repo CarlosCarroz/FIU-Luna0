@@ -1,58 +1,49 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 import pickle
+import serial
+import serial.serialutil as serialutil
 import socket
 import sys
-import time
 
-import evdev
-from evdev import events
+import consts
 
-from util import DEFAULT_PORT
-
-
-def read_joystick(client_socket: socket.socket):
-    controller: evdev.InputDevice
-    # select first device with joysticks as controller
-    for path in evdev.list_devices():
-        device = evdev.InputDevice(path)
-        # check if device has axis movement (joysticks)
-        if events.EV_ABS in device.capabilities(absinfo=False):
-            controller = device
-            break
-    else:
-        raise FileNotFoundError
-
-    print(f"Controller found: {controller.name}")
-    for event in controller.read_loop():
-        # we do not care about the time of the event, therefore sending this list[int]
-        # instead of an InputEvent takes each pickle from ~104 bytes to 22-23 in tests
-        data = (event.type, event.code, event.value)
-        if (  # all-zero events and event types 2 and 4 are ignored.
-            sum(data) != 0 and event.type % 2 != 0
-        ):
-            client_socket.sendall(pickle.dumps(data))
+RECV_SIZE = 1024
 
 
 def try_handle_client(client_socket: socket.socket):
-    first_fail = True
-    while True:  # preferred over recursively calling to avoid stack overflow
-        try:
-            read_joystick(client_socket)
-        except FileNotFoundError:
-            if first_fail:
-                print("Controller not found, connect pls.")
-        except BrokenPipeError:
-            print("Failed to send controller event, did client disconnect?")
-            break
-        except OSError as err:
-            if err.errno == 19:
-                print("Oops! controller no longer exists, did it disconnect?")
-            else:
-                raise
-        finally:
-            first_fail = False
+    try:
+        arduino = serial.Serial(port="/dev/ttyACM0", baudrate=115200, timeout=0.1)
+    except serialutil.SerialException:
+        arduino = None
+        print("No arduino found! Only debugging")
 
-        time.sleep(2)
+    while True:
+        # get all data possible
+        chunks = []
+        while True:
+            chunk = client_socket.recv(RECV_SIZE)
+            if not chunk:  # no data to receive
+                break
+
+            chunks.append(chunk)
+            if len(chunk) < RECV_SIZE:
+                break
+
+        # convert all chunks into one byte array to unpickle
+        data = b"".join(chunks)
+        if not data:  # did not receive any data, server prob closed
+            break
+
+        try:
+            state = pickle.loads(data)
+        except pickle.UnpicklingError:
+            print("ERROR: Failed to unpickle, maybe broken packet? Skipping")
+            continue
+
+        # send final resulting state to Arduino
+        if arduino:
+            arduino.write(state.get_arduino_data())
+            print(f"Arduino: {arduino.read_all()}")
 
 
 def start_server(server_socket: socket.socket, ip: str, port: int):
@@ -88,7 +79,7 @@ def fatal_help(message: str):
 
 if __name__ == "__main__":
     ip = "localhost"
-    port = DEFAULT_PORT
+    port = consts.DEFAULT_PORT
 
     for arg in sys.argv[1:]:
         if arg == "--help":
@@ -96,7 +87,7 @@ if __name__ == "__main__":
         elif arg == "--public":
             ip = "0.0.0.0"  # allows external connections
         elif arg.isdigit():
-            if port == DEFAULT_PORT:
+            if port == consts.DEFAULT_PORT:
                 port = int(arg)
             else:
                 fatal_help("Cannot set port twice, remove or fix numbers")
